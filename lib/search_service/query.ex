@@ -1,16 +1,11 @@
-defmodule SmartKioskCore.Search.Query do
+defmodule SearchService.Query do
   @moduledoc """
   Handles search query execution and result ranking with TF-IDF.
-
-  Ranking factors:
-  1. TF-IDF score (higher is better — rare, matching terms boost rank)
-  2. Edit distance penalty (lower distance = better)
-  3. Field weight (title matches rank above description)
   """
 
   require Logger
 
-  alias SmartKioskCore.Search.Engine
+  alias SearchService.Engine
 
   @typedoc "Search options"
   @type options :: [
@@ -34,15 +29,6 @@ defmodule SmartKioskCore.Search.Query do
     description: 0.3
   }
 
-  # ── Public API ──────────────────────────────────────────────────────────────
-
-  @doc """
-  Executes a search query against the index and returns ranked results.
-
-  For multi-token queries (e.g. "iphone 15") all tokens must match
-  (AND logic) and TF-IDF is computed across the combined tokens.
-  """
-  @spec execute(Engine.index(), String.t(), options()) :: [ranked_result()]
   def execute(index, query, opts \\ []) do
     start_time = System.monotonic_time(:microsecond)
 
@@ -56,10 +42,6 @@ defmodule SmartKioskCore.Search.Query do
     end
   end
 
-  @doc """
-  Prefix search — exact prefix matches only (no typos).
-  """
-  @spec prefix_search(Engine.index(), String.t(), options()) :: [ranked_result()]
   def prefix_search(index, query, opts \\ []) do
     limit = opts[:limit] || @default_limit
 
@@ -70,20 +52,6 @@ defmodule SmartKioskCore.Search.Query do
     |> Enum.take(limit)
   end
 
-  @doc """
-  Calculates the composite relevance score.
-
-  Higher scores rank higher (best match gets highest score).
-
-  Formula:
-      score = (tfidf * 0.6) + (field_weight * 0.25) - (distance_penalty * 0.15)
-
-  Where:
-    * tfidf:        TF-IDF relevance (0..N, higher = more relevant)
-    * field_weight: 1.0 for title, 0.3 for description
-    * distance:     edit distance (0 for exact, 1+ for fuzzy)
-  """
-  @spec calculate_score(float(), non_neg_integer(), atom(), float()) :: float()
   def calculate_score(tfidf, distance, _field, field_weight) do
     tfidf_component = tfidf * 0.6
     field_component = field_weight * 0.25
@@ -92,15 +60,12 @@ defmodule SmartKioskCore.Search.Query do
     tfidf_component + field_component - distance_penalty
   end
 
-  # ── Private Functions ───────────────────────────────────────────────────────
-
   defp do_execute(index, query, opts) do
     max_typos = opts[:max_typos] || Engine.calculate_typo_budget(query)
     limit = opts[:limit] || @default_limit
     field_weights = opts[:field_weights] || @default_field_weights
     tokens = Engine.tokenize(query)
 
-    # Get per-token results
     token_results =
       Enum.map(tokens, fn token ->
         if max_typos == 0 do
@@ -110,7 +75,6 @@ defmodule SmartKioskCore.Search.Query do
         end
       end)
 
-    # AND logic: intersect doc_ids across all tokens
     case token_results do
       [] ->
         []
@@ -122,7 +86,6 @@ defmodule SmartKioskCore.Search.Query do
         |> Enum.take(limit)
 
       multiple ->
-        # Build doc_id => {distances, field} map for intersection
         doc_matches = intersect_token_results(multiple)
 
         doc_matches
@@ -134,7 +97,6 @@ defmodule SmartKioskCore.Search.Query do
     end
   end
 
-  # Intersect results from multiple tokens, averaging distances.
   defp intersect_token_results(token_results) do
     [first | rest] = token_results
 
@@ -163,7 +125,6 @@ defmodule SmartKioskCore.Search.Query do
       field = metadata[:field] || :name
       field_weight = Map.get(field_weights, field, 1.0)
 
-      # TF-IDF score for this document across all query tokens
       tfidf =
         if tokens == [] do
           1.0
@@ -190,7 +151,7 @@ defmodule SmartKioskCore.Search.Query do
     duration_ms = (System.monotonic_time(:microsecond) - start_time) / 1000
 
     :telemetry.execute(
-      [:smart_kiosk, :search, :query],
+      [:search_service, :search, :query],
       %{duration_ms: duration_ms, results: result_count},
       %{tokens: token_count}
     )

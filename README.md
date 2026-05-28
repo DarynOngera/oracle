@@ -1,36 +1,48 @@
-# SmartKiosk Search Engine
+# SearchService
 
-A high-performance, native Elixir search engine for product and shop discovery using an **inverted index** with TF-IDF ranking and fuzzy matching.
+A high-performance, standalone Elixir search microservice using an **inverted index** with TF-IDF ranking and fuzzy matching.
 
 ## Overview
 
-This search engine replaces traditional SQL `ILIKE` pattern matching with an in-memory inverted index combined with Levenshtein distance for typo tolerance and TF-IDF for relevance ranking. It provides sub-10ms query response times for 150k+ products.
+SearchService replaces traditional SQL `ILIKE` pattern matching with an in-memory inverted index combined with Levenshtein distance for typo tolerance and TF-IDF for relevance ranking. It provides sub-10ms query response times for 150k+ documents.
+
+Originally extracted from the SmartKiosk e-commerce platform, this is now a fully standalone Phoenix HTTP microservice.
 
 ## Architecture
 
 ```
 ┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
-│   Web Request   │────▶│   IndexServer    │────▶│   ETS Table     │
-│   (HomeLive)    │     │   (GenServer)    │     │  (In-Memory)    │
+│   HTTP Client   │────▶│  Phoenix HTTP  │────▶│   IndexServer  │
+│  (Any language) │     │   (Bandit)     │     │   (GenServer)   │
 └─────────────────┘     └──────────────────┘     └─────────────────┘
-                               │                           │
-                               ▼                           ▼
-                        ┌──────────────┐           ┌──────────────┐
-                        │    Query     │           │   Inverted   │
-                        │  (TF-IDF     │           │    Index     │
-                        │   Ranking)   │           │              │
-                        └──────────────┘           └──────────────┘
-                               │                           │
-                               ▼                           ▼
-                        ┌──────────────┐           ┌──────────────┐
-                        │  Persistence │◀─────────▶│     File     │
-                        │  (Snapshot)  │           │  (Disk File) │
-                        └──────────────┘           └──────────────┘
+                                                        │
+                           ┌─────────────────┐           │
+                           │   BatchQueue    │◀──────────┘
+                           │  (Incremental)  │
+                           └─────────────────┘
+                                   │
+                                   ▼
+                           ┌─────────────────┐
+                           │   ETS Table     │───▶ Fast concurrent reads
+                           │  (In-Memory)    │
+                           └─────────────────┘
+                                   │
+                                   ▼
+                           ┌─────────────────┐     ┌──────────────┐
+                           │    Engine       │────▶│   Inverted   │
+                           │ (Fuzzy + TF-IDF)│     │    Index     │
+                           └─────────────────┘     └──────────────┘
+                                   │
+                                   ▼
+                           ┌─────────────────┐     ┌──────────────┐
+                           │  Persistence    │◀───▶│  Disk File   │
+                           │  (Snapshot)     │     │(Compressed)  │
+                           └─────────────────┘     └──────────────┘
 ```
 
 ## Core Components
 
-### 1. Engine (`engine.ex`)
+### 1. Engine (`SearchService.Engine`)
 
 The inverted index implementation:
 
@@ -51,12 +63,12 @@ The inverted index implementation:
 3. **Result merging**: Keep lowest distance per doc_id
 
 **Example**:
-```elixir
-# "kili" matches "kilimani", "kilimanjaro" via prefix
-# "iphoen" matches "iphone" via fuzzy (1 typo)
+```
+"kili" matches "kilimani", "kilimanjaro" via prefix
+"iphoen" matches "iphone" via fuzzy (1 typo)
 ```
 
-### 2. Query (`query.ex`)
+### 2. Query (`SearchService.Query`)
 
 Multi-token search with TF-IDF ranking:
 
@@ -75,29 +87,29 @@ Where:
 
 **Multi-token AND logic**: All tokens must match. Intersection of doc_ids across tokens.
 
-### 3. IndexServer (`index_server.ex`)
+### 3. IndexServer (`SearchService.IndexServer`)
 
 Central coordinator:
 
-- **ETS Table**: Concurrent read access for web requests
+- **ETS Table**: Concurrent read access for HTTP requests
 - **File Persistence**: Compressed snapshot (`priv/search_index.bin`)
-- **Automatic Rebuild**: Triggers rebuild on startup if stale/missing
 - **Scheduled Snapshots**: Every 24 hours (configurable)
+- **Batch Updates**: Queued changes applied on-demand
 
 **Data Flow**:
 1. Search queries read from ETS (sub-10ms)
 2. Index updates write to ETS (single writer pattern)
-3. Periodic snapshots save to file (~8MB for 150k products)
+3. Periodic snapshots save to file (~8MB for 150k documents)
 
-### 4. BatchQueue + BatchWorker
+### 4. BatchQueue
 
 Incremental updates:
 
 - **BatchQueue**: Accumulates insert/update/delete operations
-- **SearchIndexBatchWorker** (Oban, every minute): Applies queued changes to index
-- Changes trigger `Engine.finalize_index/1` to rebuild vocabulary + IDF
+- Changes applied via `POST /documents` or manual `apply_batch_changes()`
+- Deduplicates: keeps only last operation per document ID
 
-### 5. Persistence (`persistence.ex`)
+### 5. Persistence (`SearchService.Persistence`)
 
 File-based persistence with integrity checks:
 
@@ -105,107 +117,69 @@ File-based persistence with integrity checks:
 - **Load**: MD5 checksum validation → deserialization
 - **Corruption Detection**: Auto-rebuilds if checksum fails
 
-## Data Flow
+## HTTP API
 
-### Indexing Flow
-
-```
-Product/Shop Created/Updated
-         │
-         ▼
-┌─────────────────┐
-│   enqueue/1     │───▶ Adds to BatchQueue
-└─────────────────┘
-         │
-         ▼ (every minute)
-┌─────────────────┐
-│  BatchWorker    │───▶ Processes all queued changes
-└─────────────────┘
-         │
-         ▼
-┌─────────────────┐
-│  Update ETS     │───▶ Index updated atomically
-└─────────────────┘
-         │
-         ▼ (every 24h)
-┌─────────────────┐
-│  File Snapshot  │───▶ Persist to disk (~8MB)
-└─────────────────┘
-```
-
-### Search Flow
-
-```
-User Types Query
-         │
-         ▼
-┌─────────────────┐
-│  Tokenize Query │───▶ "iPhone 15" → ["iphone", "15"]
-└─────────────────┘
-         │
-         ▼
-┌─────────────────┐
-│  Lookup in ETS  │───▶ Get current index
-└─────────────────┘
-         │
-         ▼
-┌─────────────────┐
-│ Prefix + Fuzzy  │───▶ Prefix matches (dist=0) + fuzzy (dist≥1)
-└─────────────────┘
-         │
-         ▼
-┌─────────────────┐
-│  Calculate Rank │───▶ TF-IDF score + field weight − distance penalty
-└─────────────────┘
-         │
-         ▼
-┌─────────────────┐
-│ Hydrate Results │───▶ Load full structs from DB
-└─────────────────┘
-         │
-         ▼
-┌─────────────────┐
-│  Render in UI   │───▶ Display product/shop cards
-└─────────────────┘
-```
-
-## Usage
-
-### Public API
-
-```elixir
-# Search for products and shops (fuzzy + TF-IDF)
-SmartKioskCore.Search.query_products("iphone")
-# => [%{id: "...", name: "iPhone 15", type: :product, ...}, ...]
-
-# Prefix search for autocomplete
-SmartKioskCore.Search.prefix_search("iph")
-# => [%{name: "iPhone 15", type: :product}, ...]
-
-# Check index status
-SmartKioskCore.Search.ready?()
-# => true
-
-SmartKioskCore.Search.document_count()
-# => 150101
-
-# Manual rebuild
-SmartKioskCore.Search.rebuild()
-# => :ok
-
-# Diagnostics
-SmartKioskCore.Search.diagnose()
-# => %{ready: true, document_count: 150101, ...}
-```
-
-### Metrics API
+### Document Ingestion
 
 ```bash
-# Public endpoint — no authentication
-curl http://localhost:4000/api/search/metrics
+# Add/update documents (accepts array or single doc)
+curl -X POST http://localhost:4000/api/documents \
+  -H "Content-Type: application/json" \
+  -d '{
+    "documents": [
+      {"id": "prod_1", "text": "iPhone 15 Pro", "field": "product_name", "weight": 1.0},
+      {"id": "shop_1", "text": "Kilimani Electronics", "field": "shop_name", "weight": 1.0}
+    ]
+  }'
+
+# Delete a document
+curl -X DELETE http://localhost:4000/api/documents/prod_1
+
+# Full rebuild (optional: provide documents in body)
+curl -X POST http://localhost:4000/api/rebuild \
+  -H "Content-Type: application/json" \
+  -d '{"documents": [...]}'
 ```
 
-**Response**:
+### Search
+
+```bash
+# Fuzzy + TF-IDF search
+curl "http://localhost:4000/api/search?q=iphone&limit=20"
+
+# Prefix autocomplete
+curl "http://localhost:4000/api/prefix?q=kilim&limit=5"
+```
+
+**Search Response**:
+```json
+{
+  "query": "iphone",
+  "count": 2,
+  "results": [
+    {
+      "id": "prod_1",
+      "score": 0.8234,
+      "field": "product_name",
+      "distance": 0,
+      "tfidf": 1.234
+    }
+  ]
+}
+```
+
+### Health & Metrics
+
+```bash
+# Health check
+curl http://localhost:4000/api/health
+# => {"ready": true, "document_count": 150101}
+
+# Performance metrics
+curl http://localhost:4000/api/metrics
+```
+
+**Metrics Response**:
 ```json
 {
   "query_latency": {
@@ -232,32 +206,61 @@ curl http://localhost:4000/api/search/metrics
 }
 ```
 
-### Mix Tasks
+## Getting Started
+
+### Requirements
+
+- Elixir 1.14+
+- Erlang/OTP 24+
+
+### Installation
 
 ```bash
-# Rebuild search index (only if empty/stale)
-mix search.rebuild
-
-# Force rebuild even if index exists
-mix search.rebuild --force
+mix deps.get
+mix compile
 ```
+
+### Running
+
+```bash
+# Development
+mix phx.server
+
+# Or explicitly
+PORT=4000 mix run --no-halt
+
+# Production
+PORT=8080 SEARCH_API_KEY=secret mix run --no-halt
+```
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PORT` | `4000` | HTTP server port |
+| `PERSIST_PATH` | `priv/search_index.bin` | Index snapshot file path |
+| `SNAPSHOT_INTERVAL_MS` | `86400000` | Auto-save interval (24h) |
+| `SEARCH_API_KEY` | `nil` | Optional API key for mutation endpoints |
+| `SECRET_KEY_BASE` | (dev only) | Phoenix secret key |
 
 ## Configuration
 
-```elixir
-# config/config.exs
-config :smart_kiosk_core, Oban,
-  plugins: [
-    {Oban.Plugins.Cron,
-     crontab: [
-       # Batch process changes every minute
-       {"*/1 * * * *", SmartKioskCore.Workers.SearchIndexBatchWorker},
-       # Daily full rebuild at 2 AM
-       {"0 2 * * *", SmartKioskCore.Workers.SearchRebuildWorker}
-     ]}
-  ],
-  queues: [default: 10, mailer: 5, search_index: 5]
+Runtime configuration is loaded from environment variables via `config/runtime.exs`.
+
+Example production config:
+```bash
+export PORT=8080
+export PERSIST_PATH=/data/search_index.bin
+export SNAPSHOT_INTERVAL_MS=3600000  # 1 hour
+export SEARCH_API_KEY=your-secret-key-here
 ```
+
+When `SEARCH_API_KEY` is set, these endpoints require the `X-API-Key` header:
+- `POST /api/documents`
+- `DELETE /api/documents/:id`
+- `POST /api/rebuild`
+
+Read endpoints (`/search`, `/prefix`, `/metrics`, `/health`) remain open.
 
 ## Performance Characteristics
 
@@ -273,21 +276,47 @@ config :smart_kiosk_core, Oban,
 
 ## Comparison: Search vs ILIKE
 
-### ILIKE (Old)
+### ILIKE
 ```sql
 SELECT * FROM products WHERE name ILIKE '%iphone%'
 -- Pros: Simple, no extra infrastructure
 -- Cons: No typo tolerance, slow on large tables, linear scan
 ```
 
-### Inverted Index (New)
-```elixir
-SmartKioskCore.Search.query_products("ipone")
+### Inverted Index (SearchService)
+```bash
+curl "http://localhost:4000/api/search?q=ipone"
 # Returns: ["iPhone 15"] (auto-corrected 1 typo)
-SmartKioskCore.Search.query_products("iphone 15")
+
+curl "http://localhost:4000/api/search?q=iphone+15"
 # Returns: docs with BOTH "iphone" AND "15" tokens
--- Pros: Typo tolerance, TF-IDF ranking, sub-10ms, prefix autocomplete
--- Cons: Memory-only (rebuilds from DB on boot), eventual consistency (~1 min)
+```
+**Pros**: Typo tolerance, TF-IDF ranking, sub-10ms, prefix autocomplete
+**Cons**: Memory-only (persisted to disk), eventual consistency for updates
+
+## Project Structure
+
+```
+lib/
+├── search_service/
+│   ├── application.ex          # OTP supervisor
+│   ├── engine.ex               # Inverted index + fuzzy matching
+│   ├── query.ex                # TF-IDF ranking
+│   ├── index_server.ex         # GenServer + ETS coordinator
+│   ├── batch_queue.ex          # Async doc updates
+│   ├── persistence.ex          # File snapshot
+│   ├── metrics.ex              # Telemetry events
+│   └── metrics_aggregator.ex   # Rolling statistics
+└── search_service_web/
+    ├── endpoint.ex
+    ├── router.ex
+    ├── error_json.ex
+    ├── plugs/
+    │   └── api_auth.ex         # Optional API key auth
+    └── controllers/
+        ├── document_controller.ex
+        ├── search_controller.ex
+        └── metrics_controller.ex
 ```
 
 ## Troubleshooting
@@ -296,58 +325,36 @@ SmartKioskCore.Search.query_products("iphone 15")
 **Cause**: Index not built yet (first boot after deploy)
 **Solution**:
 ```bash
-mix search.rebuild --force
+curl -X POST http://localhost:4000/api/rebuild \
+  -H "Content-Type: application/json" \
+  -d '{"documents": [...]}'
 ```
 
 ### Issue: Search crashes on short queries
-**Cause**: Stale index file from old Trie version
+**Cause**: Stale index file from old version
 **Solution**:
 ```bash
-rm apps/smart_kiosk_core/priv/search_index.bin
-mix search.rebuild --force
+rm priv/search_index.bin
+curl -X POST http://localhost:4000/api/rebuild \
+  -H "Content-Type: application/json" \
+  -d '{"documents": [...]}'
 ```
 
 ### Issue: High memory usage
 **Cause**: Large document set loaded into memory
 **Solution**: Monitor with metrics endpoint:
 ```bash
-curl http://localhost:4000/api/search/metrics | jq '.index.memory_bytes'
+curl http://localhost:4000/api/metrics | jq '.index.memory_bytes'
 ```
 
 ### Issue: Slow queries (>100ms)
 **Cause**: Very short prefixes (e.g., "a") matching thousands of tokens
 **Solution**: Already mitigated — `Engine.search` caps results at `limit * 3`
 
-## Testing
-
-```elixir
-# Unit tests
- test "search handles typos" do
-   results = Search.query_products("iphne")
-   assert length(results) > 0
- end
-
- test "prefix search returns results" do
-   results = Search.prefix_search("kilim", limit: 5)
-   assert length(results) > 0
- end
-
-# Load test
- test "concurrent searches" do
-   1..1000
-   |> Task.async_stream(fn _ -> 
-     Search.query_products("test")
-   end, max_concurrency: 100)
-   |> Enum.to_list()
- end
-```
-
 ## See Also
 
-- `SmartKioskCore.Search` — Public API
-- `SmartKioskCore.Search.Engine` — Inverted index + fuzzy matching
-- `SmartKioskCore.Search.Query` — TF-IDF ranking
-- `SmartKioskCore.Search.MetricsAggregator` — Performance metrics
-- `SmartKioskWeb.Api.SearchMetricsController` — HTTP metrics endpoint
-- `SmartKioskCore.Workers.SearchRebuildWorker` — Index builder
-- `SmartKioskWeb.Components.SearchBar` — UI component
+- `SearchService.Engine` — Inverted index + fuzzy matching
+- `SearchService.Query` — TF-IDF ranking
+- `SearchService.IndexServer` — ETS + persistence coordinator
+- `SearchService.MetricsAggregator` — Performance metrics
+- `SearchServiceWeb.Router` — HTTP routing

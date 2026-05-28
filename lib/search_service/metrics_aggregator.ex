@@ -1,15 +1,6 @@
-defmodule SmartKioskCore.Search.MetricsAggregator do
+defmodule SearchService.MetricsAggregator do
   @moduledoc """
   In-memory metrics aggregator for search performance monitoring.
-
-  Collects telemetry events and maintains rolling statistics:
-  - Query latency percentiles (p50, p95, p99)
-  - Query throughput (1m, 5m counts)
-  - Index health (document count, freshness)
-  - Relevance stats (avg results, zero-result rate)
-
-  Publicly accessible via `SmartKioskCore.Search.MetricsAggregator.stats/0`
-  and the `/api/search/metrics` HTTP endpoint.
   """
 
   use GenServer
@@ -20,73 +11,47 @@ defmodule SmartKioskCore.Search.MetricsAggregator do
   @minute_ms 60_000
   @five_minute_ms 300_000
 
-  # ── Public API ──────────────────────────────────────────────────────────────
-
   def start_link(opts \\ []) do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
-  @doc """
-  Returns current aggregated search metrics.
-  """
-  @spec stats() :: map()
   def stats do
     GenServer.call(__MODULE__, :stats)
   end
 
-  @doc """
-  Records a query event directly (used by telemetry handler).
-  """
-  @spec record_query(float(), non_neg_integer(), non_neg_integer()) :: :ok
   def record_query(duration_ms, result_count, token_count) do
     GenServer.cast(__MODULE__, {:query, duration_ms, result_count, token_count})
   end
 
-  @doc """
-  Records an index rebuild event.
-  """
-  @spec record_rebuild(non_neg_integer(), non_neg_integer()) :: :ok
   def record_rebuild(doc_count, duration_ms) do
     GenServer.cast(__MODULE__, {:rebuild, doc_count, duration_ms})
   end
 
-  @doc """
-  Records current index state.
-  """
-  @spec record_index_state(non_neg_integer(), non_neg_integer()) :: :ok
   def record_index_state(doc_count, memory_bytes) do
     GenServer.cast(__MODULE__, {:index_state, doc_count, memory_bytes})
   end
 
-  # ── GenServer Callbacks ─────────────────────────────────────────────────────
-
   @impl true
   def init(_opts) do
-    # Attach to telemetry events
     :telemetry.attach_many(
       "search-aggregator",
       [
-        [:smart_kiosk, :search, :query],
-        [:smart_kiosk, :search, :index, :rebuild]
+        [:search_service, :search, :query],
+        [:search_service, :search, :index, :rebuild]
       ],
       &handle_telemetry/4,
       nil
     )
 
     state = %{
-      # Query latency circular buffer: [{duration_ms, timestamp}, ...]
       query_latencies: [],
-      # Query result counts: [{count, timestamp}, ...]
       query_results: [],
-      # Counters for time windows
       queries_1m: 0,
       queries_5m: 0,
-      # Index state
       index_doc_count: 0,
       index_memory_bytes: 0,
       last_rebuild_at: nil,
       last_rebuild_duration_ms: 0,
-      # Derived stats
       total_queries: 0,
       zero_result_queries: 0
     }
@@ -98,7 +63,6 @@ defmodule SmartKioskCore.Search.MetricsAggregator do
   def handle_call(:stats, _from, state) do
     now = System.monotonic_time(:millisecond)
 
-    # Filter to recent windows
     recent_1m = filter_recent(state.query_latencies, now, @minute_ms)
     recent_5m = filter_recent(state.query_latencies, now, @five_minute_ms)
 
@@ -179,22 +143,18 @@ defmodule SmartKioskCore.Search.MetricsAggregator do
      }}
   end
 
-  # ── Telemetry Handler ────────────────────────────────────────────────────────
-
-  defp handle_telemetry([:smart_kiosk, :search, :query], measurements, _metadata, _config) do
+  defp handle_telemetry([:search_service, :search, :query], measurements, _metadata, _config) do
     record_query(measurements.duration_ms, measurements.results, 1)
   end
 
   defp handle_telemetry(
-         [:smart_kiosk, :search, :index, :rebuild],
+         [:search_service, :search, :index, :rebuild],
          measurements,
          _metadata,
          _config
        ) do
     record_rebuild(measurements.documents, measurements.duration_ms)
   end
-
-  # ── Private Helpers ──────────────────────────────────────────────────────────
 
   defp filter_recent(list, now, window_ms) do
     Enum.filter(list, fn {_val, ts} -> now - ts <= window_ms end)

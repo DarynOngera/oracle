@@ -1,19 +1,9 @@
-defmodule SmartKioskCore.Search.Persistence do
+defmodule SearchService.Persistence do
   @moduledoc """
   Manages disk persistence of the search index using plain files.
-
-  The inverted index serialises to ~8 MB for 150k products, well within
-  safe limits for `:erlang.term_to_binary/2`.
-
-  Approach:
-  - Serialise with `:erlang.term_to_binary/2` (compressed)
-  - Write to a temp file, then rename atomically
-  - Verify with an MD5 checksum stored alongside the data
   """
 
   require Logger
-
-  alias SmartKioskCore.Search.Engine
 
   @typedoc "Persistence result"
   @type result :: :ok | {:error, term()}
@@ -21,12 +11,6 @@ defmodule SmartKioskCore.Search.Persistence do
   @checksum_key :__checksum__
   @data_key :__trie_data__
 
-  # ── Public API ──────────────────────────────────────────────────────────────
-
-  @doc """
-  Saves the index to disk with a checksum for corruption detection.
-  """
-  @spec save(Engine.index(), String.t()) :: result()
   def save(index, path) do
     serialized = :erlang.term_to_binary(index, compressed: 9)
     checksum = :erlang.md5(serialized)
@@ -49,10 +33,6 @@ defmodule SmartKioskCore.Search.Persistence do
     end
   end
 
-  @doc """
-  Loads the index from disk and verifies checksum.
-  """
-  @spec load(String.t()) :: {:ok, Engine.index()} | {:error, atom()}
   def load(path) do
     case File.read(path) do
       {:ok, payload} ->
@@ -67,10 +47,8 @@ defmodule SmartKioskCore.Search.Persistence do
     end
   end
 
-  @spec exists?(String.t()) :: boolean()
   def exists?(path), do: File.exists?(path)
 
-  @spec delete(String.t()) :: :ok | {:error, term()}
   def delete(path) do
     case File.rm(path) do
       :ok ->
@@ -86,15 +64,12 @@ defmodule SmartKioskCore.Search.Persistence do
     end
   end
 
-  @spec stats(String.t()) :: {:ok, map()} | {:error, term()}
   def stats(path) do
     case File.stat(path) do
       {:ok, info} -> {:ok, %{size: info.size, mtime: info.mtime}}
       {:error, reason} -> {:error, reason}
     end
   end
-
-  # ── Private Functions ───────────────────────────────────────────────────────
 
   defp do_load(payload, path) do
     with {@checksum_key, stored_checksum, @data_key, serialized} <-

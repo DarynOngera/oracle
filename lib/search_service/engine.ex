@@ -1,17 +1,6 @@
-defmodule SmartKioskCore.Search.Engine do
+defmodule SearchService.Engine do
   @moduledoc """
   Inverted-index search engine with fuzzy matching and TF-IDF ranking.
-
-  Replaces the previous Trie implementation which OOM'd at 150k products.
-  The inverted index stores:
-
-    * postings   — token → [{doc_id, field, weight}]
-    * vocabulary — sorted list of all tokens (for prefix / fuzzy lookup)
-    * docs       — doc_id → %{name, shop_name, token_count}
-    * idf        — token → inverse document frequency (precomputed)
-
-  Memory: ~24 MB for 150k products (vs ~1 GB+ for the Trie).
-  Serialization: ~8 MB compressed (safe for `term_to_binary`).
   """
 
   require Logger
@@ -40,12 +29,6 @@ defmodule SmartKioskCore.Search.Engine do
 
   @build_yield_every 1_000
 
-  # ── Public API ──────────────────────────────────────────────────────────────
-
-  @doc """
-  Returns an empty index struct for incremental builds.
-  """
-  @spec empty_index() :: index()
   def empty_index do
     %{
       postings: %{},
@@ -56,16 +39,10 @@ defmodule SmartKioskCore.Search.Engine do
     }
   end
 
-  @doc """
-  Finalizes an index after incremental inserts by sorting vocabulary
-  and computing IDF values.
-  """
-  @spec finalize_index(index()) :: index()
   def finalize_index(index) do
     vocab = Map.keys(index.postings) |> Enum.sort()
     idf = compute_idf(index.postings, map_size(index.docs))
 
-    # Sort tokens within each length bucket for binary search
     length_index =
       Map.new(index.length_index, fn {len, tokens} ->
         {len, Enum.sort(Enum.uniq(tokens))}
@@ -74,10 +51,6 @@ defmodule SmartKioskCore.Search.Engine do
     %{index | vocabulary: vocab, idf: idf, length_index: length_index}
   end
 
-  @doc """
-  Builds an inverted index from a list of documents.
-  """
-  @spec build_index([document()]) :: index()
   def build_index(documents) do
     base = %{
       postings: %{},
@@ -101,18 +74,10 @@ defmodule SmartKioskCore.Search.Engine do
     |> finalize_index()
   end
 
-  @doc """
-  Inserts a single document into an existing index.
-  """
-  @spec insert(index(), String.t(), term(), atom(), float()) :: index()
   def insert(index, text, doc_id, field \\ :name, weight \\ 1.0) do
     insert_document(index, %{id: doc_id, text: text, field: field, weight: weight})
   end
 
-  @doc """
-  Removes a document from the index by ID.
-  """
-  @spec remove(index(), term()) :: index()
   def remove(index, doc_id) do
     postings =
       Enum.reduce(index.postings, %{}, fn {token, entries}, acc ->
@@ -127,24 +92,10 @@ defmodule SmartKioskCore.Search.Engine do
 
     docs = Map.delete(index.docs, doc_id)
 
-    # Rebuild vocabulary, idf, and length_index after removal
     %{index | postings: postings, docs: docs}
     |> finalize_index()
   end
 
-  @doc """
-  Hybrid fuzzy + prefix search.
-
-  First collects exact prefix matches (distance = 0), then fuzzy matches
-  (distance = 1..max_typos). Results are merged, keeping the lowest
-  distance per doc_id.
-
-  Stops collecting once `limit * 3` doc_ids are gathered to avoid
-  processing massive result sets for short prefixes.
-
-  Returns a list of `{doc_id, distance, field}` tuples.
-  """
-  @spec search(index(), String.t(), keyword()) :: [search_result()]
   def search(index, query, opts \\ []) do
     max_typos = opts[:max_typos] || calculate_typo_budget(query)
     limit = opts[:limit] || 50
@@ -156,7 +107,6 @@ defmodule SmartKioskCore.Search.Engine do
       if map_size(acc) >= collect_limit do
         acc
       else
-        # Step 1: prefix matches (distance = 0)
         prefix_tokens = prefix_matches(index.vocabulary, token)
 
         acc =
@@ -176,7 +126,6 @@ defmodule SmartKioskCore.Search.Engine do
             end
           end)
 
-        # Step 2: fuzzy matches (distance = 1..max_typos)
         if map_size(acc) >= collect_limit do
           acc
         else
@@ -211,11 +160,6 @@ defmodule SmartKioskCore.Search.Engine do
     |> Enum.map(fn {doc_id, {distance, field}} -> {doc_id, distance, field} end)
   end
 
-  @doc """
-  Prefix search — exact prefix matches, no typos.
-  Results capped to `limit` (default 50).
-  """
-  @spec prefix_search(index(), String.t(), keyword()) :: [search_result()]
   def prefix_search(index, query, opts \\ []) do
     limit = opts[:limit] || 50
 
@@ -245,20 +189,10 @@ defmodule SmartKioskCore.Search.Engine do
     |> Enum.take(limit)
   end
 
-  @doc """
-  Returns all document IDs in the index.
-  """
-  @spec all_doc_ids(index()) :: MapSet.t()
   def all_doc_ids(index) do
     index.docs |> Map.keys() |> MapSet.new()
   end
 
-  @doc """
-  Returns the TF-IDF score for a document and a list of matching tokens.
-
-  Used by Query for ranking.
-  """
-  @spec tfidf_score(index(), term(), [String.t()]) :: float()
   def tfidf_score(index, doc_id, tokens) do
     doc = Map.get(index.docs, doc_id, %{token_count: 1})
     tf_norm = 1.0 / max(doc.token_count, 1)
@@ -269,14 +203,6 @@ defmodule SmartKioskCore.Search.Engine do
     end)
   end
 
-  @doc """
-  Calculates the typo budget based on word length.
-
-    * < 4 characters: 0 typos
-    * 4-8 characters: 1 typo
-    * > 8 characters: 2 typos
-  """
-  @spec calculate_typo_budget(String.t()) :: non_neg_integer()
   def calculate_typo_budget(text) do
     len = String.length(text)
 
@@ -287,10 +213,6 @@ defmodule SmartKioskCore.Search.Engine do
     end
   end
 
-  @doc """
-  Normalizes and tokenizes text into searchable terms.
-  """
-  @spec tokenize(String.t()) :: [String.t()]
   def tokenize(text) when is_binary(text) do
     text
     |> String.downcase()
@@ -300,8 +222,6 @@ defmodule SmartKioskCore.Search.Engine do
   end
 
   def tokenize(_), do: []
-
-  # ── Private Functions ───────────────────────────────────────────────────────
 
   defp insert_document(index, doc) do
     tokens = tokenize(doc.text)
@@ -313,15 +233,12 @@ defmodule SmartKioskCore.Search.Engine do
         Map.update(acc, token, [{doc.id, field, weight}], &[{doc.id, field, weight} | &1])
       end)
 
-    # Build length index for fast fuzzy filtering
     length_index =
       Enum.reduce(tokens, index.length_index, fn token, acc ->
         len = String.length(token)
         Map.update(acc, len, [token], &[token | &1])
       end)
 
-    # Extract name and shop_name from document text for metadata
-    # The text format is "product_name shop_name"
     parts = String.split(doc.text, ~r/\s+/, trim: true)
     name = if parts == [], do: "", else: hd(parts)
     shop_name = if length(parts) > 1, do: Enum.join(tl(parts), " "), else: ""
@@ -346,17 +263,10 @@ defmodule SmartKioskCore.Search.Engine do
 
   defp compute_idf(_postings, _total_docs), do: %{}
 
-  # ── Fuzzy matching ────────────────────────────────────────────────────────────
-
-  # Returns [{vocab_token, distance}, ...] for all vocabulary tokens within
-  # `max_typos` edit distance of `target`.
-  # Uses length_index to avoid scanning the entire vocabulary.
   defp fuzzy_candidates(index, target, max_typos) do
-    # Fallback if index was loaded from old file without length_index
-    length_index = Map.get(index, :length_index, %{})
+    length_index = Map.get(index, :length_index, %{}) || %{}
 
     if map_size(length_index) == 0 do
-      # Fallback to full vocabulary scan (slow but safe)
       target_len = String.length(target)
 
       index.vocabulary
@@ -373,14 +283,12 @@ defmodule SmartKioskCore.Search.Engine do
       min_len = max(target_len - max_typos, 1)
       max_len = target_len + max_typos
 
-      # Collect tokens from relevant length buckets
       candidate_tokens =
         for len <- min_len..max_len,
             tokens = Map.get(length_index, len, []),
             token <- tokens,
             do: token
 
-      # Compute Levenshtein distance only on filtered candidates
       candidate_tokens
       |> Enum.map(fn vocab_token ->
         {vocab_token, levenshtein_distance(target, vocab_token)}
@@ -389,7 +297,6 @@ defmodule SmartKioskCore.Search.Engine do
     end
   end
 
-  # Standard Levenshtein distance ( Wagner-Fischer ).
   defp levenshtein_distance(s1, s2) do
     len1 = String.length(s1)
     len2 = String.length(s2)
@@ -400,7 +307,6 @@ defmodule SmartKioskCore.Search.Engine do
     chars1 = String.graphemes(s1)
     chars2 = String.graphemes(s2)
 
-    # Space-optimised: keep only the previous row
     prev_row = Enum.to_list(0..len2)
 
     Enum.reduce(chars1, prev_row, fn c1, row ->
@@ -418,20 +324,13 @@ defmodule SmartKioskCore.Search.Engine do
     |> List.last()
   end
 
-  # ── Prefix matching ───────────────────────────────────────────────────────────
-
-  # O(log n + k) prefix lookup using binary search + bidirectional scan.
   defp prefix_matches([], _prefix), do: []
 
   defp prefix_matches(vocabulary, prefix) do
     n = length(vocabulary)
-    # Find the first token >= prefix via binary search
     idx = find_lower_bound(vocabulary, prefix, 0, n)
 
-    # Scan backward from idx while tokens still start with prefix
     left = scan_backward(vocabulary, idx, prefix, [])
-
-    # Scan forward from idx while tokens still start with prefix
     right = scan_forward(vocabulary, idx, prefix, [])
 
     left ++ right
