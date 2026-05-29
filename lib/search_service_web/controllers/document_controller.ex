@@ -13,7 +13,7 @@ defmodule SearchServiceWeb.DocumentController do
 
   defp safe_field(field) when is_binary(field) do
     if field in @known_fields do
-      String.to_existing_atom(field)
+      String.to_atom(field)
     else
       :name
     end

@@ -1,6 +1,11 @@
 defmodule SearchService.Engine do
   @moduledoc """
   Inverted-index search engine with fuzzy matching and TF-IDF ranking.
+
+  Optimizations for 150k+ documents:
+  - Batch updates: insert/remove are O(1), finalize rebuilds vocab/IDF once.
+  - Vocabulary stored as an Erlang :array for true O(log N) prefix binary search.
+  - Bounded Levenshtein with early-exit avoids full matrix computation for non-matches.
   """
 
   require Logger
@@ -16,12 +21,13 @@ defmodule SearchService.Engine do
   @typedoc "Inverted index data structure"
   @type index :: %{
           postings: %{String.t() => [{term(), atom(), float()}]},
-          vocabulary: [String.t()],
+          vocabulary: :array.array(),
           docs: %{
             term() => %{name: String.t(), shop_name: String.t(), token_count: pos_integer()}
           },
           idf: %{String.t() => float()},
-          length_index: %{pos_integer() => [String.t()]}
+          length_index: %{pos_integer() => [String.t()]},
+          dirty: boolean()
         }
 
   @typedoc "Raw search result"
@@ -32,32 +38,40 @@ defmodule SearchService.Engine do
   def empty_index do
     %{
       postings: %{},
-      vocabulary: [],
+      vocabulary: :array.new(),
       docs: %{},
       idf: %{},
-      length_index: %{}
+      length_index: %{},
+      dirty: false
     }
   end
+
+  @doc """
+  Ensures the index is finalized before search.
+  If the index is dirty (inserts/removes pending), rebuilds vocabulary, idf, and length_index.
+  """
+  def ensure_finalized(%{dirty: false} = index), do: index
+  def ensure_finalized(index), do: finalize_index(index)
 
   def finalize_index(index) do
     vocab = Map.keys(index.postings) |> Enum.sort()
+    vocab_array = :array.from_list(vocab)
     idf = compute_idf(index.postings, map_size(index.docs))
 
     length_index =
-      Map.new(index.length_index, fn {len, tokens} ->
+      Enum.reduce(vocab, %{}, fn token, acc ->
+        len = String.length(token)
+        Map.update(acc, len, [token], &[token | &1])
+      end)
+      |> Map.new(fn {len, tokens} ->
         {len, Enum.sort(Enum.uniq(tokens))}
       end)
 
-    %{index | vocabulary: vocab, idf: idf, length_index: length_index}
+    %{index | vocabulary: vocab_array, idf: idf, length_index: length_index, dirty: false}
   end
 
   def build_index(documents) do
-    base = %{
-      postings: %{},
-      vocabulary: [],
-      docs: %{},
-      idf: %{}
-    }
+    base = empty_index()
 
     {indexed, total_docs} =
       documents
@@ -76,6 +90,7 @@ defmodule SearchService.Engine do
 
   def insert(index, text, doc_id, field \\ :name, weight \\ 1.0) do
     insert_document(index, %{id: doc_id, text: text, field: field, weight: weight})
+    |> Map.put(:dirty, true)
   end
 
   def remove(index, doc_id) do
@@ -92,8 +107,7 @@ defmodule SearchService.Engine do
 
     docs = Map.delete(index.docs, doc_id)
 
-    %{index | postings: postings, docs: docs}
-    |> finalize_index()
+    %{index | postings: postings, docs: docs, dirty: true}
   end
 
   def search(index, query, opts \\ []) do
@@ -233,12 +247,6 @@ defmodule SearchService.Engine do
         Map.update(acc, token, [{doc.id, field, weight}], &[{doc.id, field, weight} | &1])
       end)
 
-    length_index =
-      Enum.reduce(tokens, index.length_index, fn token, acc ->
-        len = String.length(token)
-        Map.update(acc, len, [token], &[token | &1])
-      end)
-
     parts = String.split(doc.text, ~r/\s+/, trim: true)
     name = if parts == [], do: "", else: hd(parts)
     shop_name = if length(parts) > 1, do: Enum.join(tl(parts), " "), else: ""
@@ -250,7 +258,7 @@ defmodule SearchService.Engine do
         token_count: length(tokens)
       })
 
-    %{index | postings: postings, docs: docs, length_index: length_index}
+    %{index | postings: postings, docs: docs}
   end
 
   defp compute_idf(postings, total_docs) when total_docs > 0 do
@@ -267,15 +275,17 @@ defmodule SearchService.Engine do
     length_index = Map.get(index, :length_index, %{}) || %{}
 
     if map_size(length_index) == 0 do
+      vocab = index.vocabulary
+      tokens = if is_list(vocab), do: vocab, else: :array.to_list(vocab)
       target_len = String.length(target)
 
-      index.vocabulary
+      tokens
       |> Enum.filter(fn vocab_token ->
         vocab_len = String.length(vocab_token)
         abs(vocab_len - target_len) <= max_typos
       end)
       |> Enum.map(fn vocab_token ->
-        {vocab_token, levenshtein_distance(target, vocab_token)}
+        {vocab_token, bounded_levenshtein(target, vocab_token, max_typos)}
       end)
       |> Enum.filter(fn {_token, distance} -> distance <= max_typos end)
     else
@@ -291,87 +301,123 @@ defmodule SearchService.Engine do
 
       candidate_tokens
       |> Enum.map(fn vocab_token ->
-        {vocab_token, levenshtein_distance(target, vocab_token)}
+        {vocab_token, bounded_levenshtein(target, vocab_token, max_typos)}
       end)
       |> Enum.filter(fn {_token, distance} -> distance <= max_typos end)
     end
   end
 
-  defp levenshtein_distance(s1, s2) do
+  defp bounded_levenshtein(s1, s2, max_dist) do
     len1 = String.length(s1)
     len2 = String.length(s2)
 
-    if len1 == 0, do: len2
-    if len2 == 0, do: len1
+    cond do
+      max_dist < 0 ->
+        max_dist + 1
 
-    chars1 = String.graphemes(s1)
-    chars2 = String.graphemes(s2)
+      len1 == 0 ->
+        if len2 <= max_dist, do: len2, else: max_dist + 1
 
+      len2 == 0 ->
+        if len1 <= max_dist, do: len1, else: max_dist + 1
+
+      abs(len1 - len2) > max_dist ->
+        max_dist + 1
+
+      true ->
+        do_bounded_levenshtein(String.graphemes(s1), String.graphemes(s2), max_dist)
+    end
+  end
+
+  defp do_bounded_levenshtein(chars1, chars2, max_dist) do
+    len2 = length(chars2)
     prev_row = Enum.to_list(0..len2)
 
-    Enum.reduce(chars1, prev_row, fn c1, row ->
-      {_, new_row} =
-        Enum.reduce(chars2, {1, [1]}, fn c2, {i, acc} ->
-          cost = if c1 == c2, do: 0, else: 1
-          deletion = Enum.at(row, i) + 1
-          insertion = hd(acc) + 1
-          substitution = Enum.at(row, i - 1) + cost
-          {i + 1, [min(deletion, min(insertion, substitution)) | acc]}
-        end)
+    {final_row, exceeded} =
+      Enum.reduce(chars1, {prev_row, false}, fn c1, {row, exceeded} ->
+        if exceeded do
+          {row, true}
+        else
+          {_, new_row} =
+            Enum.reduce(chars2, {1, [1]}, fn c2, {i, acc} ->
+              cost = if c1 == c2, do: 0, else: 1
+              deletion = Enum.at(row, i) + 1
+              insertion = hd(acc) + 1
+              substitution = Enum.at(row, i - 1) + cost
+              {i + 1, [min(deletion, min(insertion, substitution)) | acc]}
+            end)
 
-      new_row |> Enum.reverse()
-    end)
-    |> List.last()
+          new_row = Enum.reverse(new_row)
+          min_in_row = Enum.min(new_row)
+
+          if min_in_row > max_dist do
+            {new_row, true}
+          else
+            {new_row, false}
+          end
+        end
+      end)
+
+    if exceeded do
+      max_dist + 1
+    else
+      List.last(final_row)
+    end
   end
 
-  defp prefix_matches([], _prefix), do: []
+  defp prefix_matches(vocab_array, prefix) do
+    n = :array.size(vocab_array)
 
-  defp prefix_matches(vocabulary, prefix) do
-    n = length(vocabulary)
-    idx = find_lower_bound(vocabulary, prefix, 0, n)
+    if n == 0 do
+      []
+    else
+      idx = find_lower_bound(vocab_array, prefix, 0, n)
 
-    left = scan_backward(vocabulary, idx, prefix, [])
-    right = scan_forward(vocabulary, idx, prefix, [])
+      left = scan_backward(vocab_array, idx - 1, prefix, [])
+      right = scan_forward(vocab_array, idx, prefix, [])
 
-    left ++ right
+      left ++ right
+    end
   end
 
-  defp scan_backward(_vocabulary, -1, _prefix, acc), do: acc
+  defp scan_backward(_arr, -1, _prefix, acc), do: acc
 
-  defp scan_backward(vocabulary, idx, prefix, acc) when idx >= 0 do
-    token = Enum.at(vocabulary, idx)
+  defp scan_backward(arr, idx, prefix, acc) when idx >= 0 do
+    token = :array.get(idx, arr)
 
     if String.starts_with?(token, prefix) do
-      scan_backward(vocabulary, idx - 1, prefix, [token | acc])
+      scan_backward(arr, idx - 1, prefix, [token | acc])
     else
       acc
     end
   end
 
-  defp scan_backward(_vocabulary, _idx, _prefix, acc), do: acc
+  defp scan_forward(arr, idx, prefix, acc) do
+    n = :array.size(arr)
 
-  defp scan_forward(vocabulary, idx, prefix, acc) when idx < length(vocabulary) do
-    token = Enum.at(vocabulary, idx)
+    if idx < n do
+      token = :array.get(idx, arr)
 
-    if String.starts_with?(token, prefix) do
-      scan_forward(vocabulary, idx + 1, prefix, [token | acc])
+      if String.starts_with?(token, prefix) do
+        scan_forward(arr, idx + 1, prefix, [token | acc])
+      else
+        acc
+      end
     else
       acc
     end
   end
 
-  defp scan_forward(_vocabulary, _idx, _prefix, acc), do: acc
+  defp find_lower_bound(_arr, _target, low, high) when low >= high, do: low
 
-  defp find_lower_bound(_vocabulary, _target, low, high) when low >= high, do: low
-
-  defp find_lower_bound(vocabulary, target, low, high) do
+  defp find_lower_bound(arr, target, low, high) do
     mid = div(low + high, 2)
-    mid_val = Enum.at(vocabulary, mid)
+    mid_val = :array.get(mid, arr)
 
     if mid_val < target do
-      find_lower_bound(vocabulary, target, mid + 1, high)
+      find_lower_bound(arr, target, mid + 1, high)
     else
-      find_lower_bound(vocabulary, target, low, mid)
+      find_lower_bound(arr, target, low, mid)
     end
   end
 end

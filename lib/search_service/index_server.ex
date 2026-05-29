@@ -121,7 +121,8 @@ defmodule SearchService.IndexServer do
           }
 
         {:error, reason} ->
-          Logger.warning("IndexServer: Could not load index (#{reason}), will rebuild")
+          Logger.warning("IndexServer: Could not load index (#{reason}), starting empty")
+          :ets.insert(ets_table, {:index, Engine.empty_index()})
           state
       end
 
@@ -279,19 +280,29 @@ defmodule SearchService.IndexServer do
   end
 
   defp apply_changes(index, changes) do
-    Enum.reduce(changes, {index, 0}, fn change, {acc_index, delta} ->
-      case change do
-        {:insert, doc} ->
-          {Engine.insert(acc_index, doc.text, doc.id, doc[:field] || :name, doc[:weight] || 1.0),
-           delta + 1}
+    {dirty_index, count_delta} =
+      Enum.reduce(changes, {index, 0}, fn change, {acc_index, delta} ->
+        case change do
+          {:insert, doc} ->
+            {Engine.insert(
+               acc_index,
+               doc.text,
+               doc.id,
+               doc[:field] || :name,
+               doc[:weight] || 1.0
+             ), delta + 1}
 
-        {:update, doc} ->
-          idx = Engine.remove(acc_index, doc.id)
-          {Engine.insert(idx, doc.text, doc.id, doc[:field] || :name, doc[:weight] || 1.0), delta}
+          {:update, doc} ->
+            idx = Engine.remove(acc_index, doc.id)
 
-        {:delete, doc_id} ->
-          {Engine.remove(acc_index, doc_id), delta - 1}
-      end
-    end)
+            {Engine.insert(idx, doc.text, doc.id, doc[:field] || :name, doc[:weight] || 1.0),
+             delta}
+
+          {:delete, doc_id} ->
+            {Engine.remove(acc_index, doc_id), delta - 1}
+        end
+      end)
+
+    {Engine.finalize_index(dirty_index), count_delta}
   end
 end
