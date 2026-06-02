@@ -82,4 +82,18 @@ defmodule SearchServiceWeb.DocumentController do
     |> put_status(:ok)
     |> json(%{status: "rebuilt", document_count: length(documents)})
   end
+
+  def snapshot(conn, _params) do
+    case IndexServer.snapshot() do
+      :ok ->
+        conn
+        |> put_status(:ok)
+        |> json(%{status: "saved"})
+
+      {:error, reason} ->
+        conn
+        |> put_status(:service_unavailable)
+        |> json(%{error: "snapshot failed: #{reason}"})
+    end
+  end
 end

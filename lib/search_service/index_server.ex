@@ -1,6 +1,6 @@
 defmodule SearchService.IndexServer do
   @moduledoc """
-  GenServer managing the in-memory search index with ETS and file backing.
+  GenServer managing the in-memory search index with persistent_term and file backing.
   """
 
   use GenServer
@@ -11,7 +11,6 @@ defmodule SearchService.IndexServer do
 
   @typedoc "Index server state"
   @type state :: %{
-          ets_table: :ets.table(),
           persist_path: String.t(),
           snapshot_timer: reference() | nil,
           last_snapshot: DateTime.t() | nil,
@@ -19,28 +18,49 @@ defmodule SearchService.IndexServer do
           doc_count: non_neg_integer()
         }
 
-  @ets_table :search_index
-
   def start_link(opts \\ []) do
     name = opts[:name] || __MODULE__
     GenServer.start_link(__MODULE__, opts, name: name)
   end
 
   def search(query, opts \\ []) do
-    case lookup_index() do
-      nil ->
-        Logger.warning("IndexServer: Search attempted but index not loaded")
-        []
+    cache_key = {:search, query, opts[:limit] || 50}
 
-      index ->
-        SearchService.Query.execute(index, query, opts)
+    case :ets.lookup(:search_cache, cache_key) do
+      [{^cache_key, results}] ->
+        results
+
+      [] ->
+        case lookup_index() do
+          nil ->
+            Logger.warning("IndexServer: Search attempted but index not loaded")
+            []
+
+          index ->
+            results = SearchService.Query.execute(index, query, opts)
+            :ets.insert(:search_cache, {cache_key, results})
+            results
+        end
     end
   end
 
   def prefix_search(query, opts \\ []) do
-    case lookup_index() do
-      nil -> []
-      index -> SearchService.Query.prefix_search(index, query, opts)
+    cache_key = {:prefix, query, opts[:limit] || 50}
+
+    case :ets.lookup(:search_cache, cache_key) do
+      [{^cache_key, results}] ->
+        results
+
+      [] ->
+        case lookup_index() do
+          nil ->
+            []
+
+          index ->
+            results = SearchService.Query.prefix_search(index, query, opts)
+            :ets.insert(:search_cache, {cache_key, results})
+            results
+        end
     end
   end
 
@@ -66,7 +86,7 @@ defmodule SearchService.IndexServer do
   end
 
   def snapshot do
-    GenServer.call(__MODULE__, :snapshot)
+    GenServer.call(__MODULE__, :snapshot, :infinity)
   end
 
   def stats do
@@ -83,7 +103,7 @@ defmodule SearchService.IndexServer do
 
   def apply_batch_changes do
     changes = BatchQueue.dequeue_all()
-    GenServer.call(__MODULE__, {:apply_changes, changes})
+    GenServer.call(__MODULE__, {:apply_changes, changes}, :infinity)
   end
 
   @impl true
@@ -91,16 +111,14 @@ defmodule SearchService.IndexServer do
     persist_path = opts[:persist_path] || default_persist_path()
     snapshot_interval = opts[:snapshot_interval_ms] || 86_400_000
 
-    ets_table =
-      :ets.new(@ets_table, [
-        :set,
-        :protected,
-        :named_table,
-        read_concurrency: true
-      ])
+    :ets.new(:search_cache, [
+      :set,
+      :public,
+      :named_table,
+      read_concurrency: true
+    ])
 
     state = %{
-      ets_table: ets_table,
       persist_path: persist_path,
       snapshot_timer: nil,
       last_snapshot: nil,
@@ -111,7 +129,8 @@ defmodule SearchService.IndexServer do
     state =
       case Persistence.load(persist_path) do
         {:ok, index} ->
-          :ets.insert(ets_table, {:index, index})
+          index = Engine.ensure_finalized(index)
+          :persistent_term.put(:search_index, index)
           count = map_size(index.docs)
 
           %{
@@ -122,7 +141,7 @@ defmodule SearchService.IndexServer do
 
         {:error, reason} ->
           Logger.warning("IndexServer: Could not load index (#{reason}), starting empty")
-          :ets.insert(ets_table, {:index, Engine.empty_index()})
+          :persistent_term.put(:search_index, Engine.empty_index())
           state
       end
 
@@ -135,7 +154,8 @@ defmodule SearchService.IndexServer do
 
   @impl true
   def handle_call({:swap_index, index, doc_count}, _from, state) do
-    :ets.insert(state.ets_table, {:index, index})
+    :persistent_term.put(:search_index, index)
+    :ets.delete_all_objects(:search_cache)
 
     new_stats = %{
       documents: doc_count,
@@ -161,7 +181,8 @@ defmodule SearchService.IndexServer do
 
       index ->
         {new_index, count_delta} = apply_changes(index, changes)
-        :ets.insert(state.ets_table, {:index, new_index})
+        :persistent_term.put(:search_index, new_index)
+        :ets.delete_all_objects(:search_cache)
 
         new_count = max(state.doc_count + count_delta, 0)
 
@@ -269,10 +290,7 @@ defmodule SearchService.IndexServer do
   end
 
   defp lookup_index do
-    case :ets.lookup(@ets_table, :index) do
-      [{:index, index}] -> index
-      [] -> nil
-    end
+    :persistent_term.get(:search_index, nil)
   end
 
   defp default_persist_path do

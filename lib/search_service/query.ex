@@ -32,8 +32,6 @@ defmodule SearchService.Query do
   def execute(index, query, opts \\ []) do
     start_time = System.monotonic_time(:microsecond)
 
-    index = Engine.ensure_finalized(index)
-
     if query == nil or String.trim(query) == "" do
       log_metrics(0, 0, start_time)
       []
@@ -46,7 +44,6 @@ defmodule SearchService.Query do
 
   def prefix_search(index, query, opts \\ []) do
     limit = opts[:limit] || @default_limit
-    index = Engine.ensure_finalized(index)
 
     index
     |> Engine.prefix_search(query, limit: limit)

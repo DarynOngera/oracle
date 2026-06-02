@@ -122,6 +122,7 @@ defmodule SearchService.Engine do
         acc
       else
         prefix_tokens = prefix_matches(index.vocabulary, token)
+        exact_match = vocab_contains?(index.vocabulary, token)
 
         acc =
           Enum.reduce(prefix_tokens, acc, fn vocab_token, inner_acc ->
@@ -140,7 +141,7 @@ defmodule SearchService.Engine do
             end
           end)
 
-        if map_size(acc) >= collect_limit do
+        if map_size(acc) >= collect_limit or exact_match do
           acc
         else
           fuzzy_candidates(index, token, max_typos)
@@ -273,6 +274,7 @@ defmodule SearchService.Engine do
 
   defp fuzzy_candidates(index, target, max_typos) do
     length_index = Map.get(index, :length_index, %{}) || %{}
+    target_first = String.first(target)
 
     if map_size(length_index) == 0 do
       vocab = index.vocabulary
@@ -282,7 +284,7 @@ defmodule SearchService.Engine do
       tokens
       |> Enum.filter(fn vocab_token ->
         vocab_len = String.length(vocab_token)
-        abs(vocab_len - target_len) <= max_typos
+        abs(vocab_len - target_len) <= max_typos and String.first(vocab_token) == target_first
       end)
       |> Enum.map(fn vocab_token ->
         {vocab_token, bounded_levenshtein(target, vocab_token, max_typos)}
@@ -297,6 +299,7 @@ defmodule SearchService.Engine do
         for len <- min_len..max_len,
             tokens = Map.get(length_index, len, []),
             token <- tokens,
+            String.first(token) == target_first,
             do: token
 
       candidate_tokens
@@ -331,24 +334,24 @@ defmodule SearchService.Engine do
 
   defp do_bounded_levenshtein(chars1, chars2, max_dist) do
     len2 = length(chars2)
-    prev_row = Enum.to_list(0..len2)
+    prev_row = List.to_tuple(Enum.to_list(0..len2))
 
     {final_row, exceeded} =
       Enum.reduce(chars1, {prev_row, false}, fn c1, {row, exceeded} ->
         if exceeded do
           {row, true}
         else
-          {_, new_row} =
+          {_, new_row_list} =
             Enum.reduce(chars2, {1, [1]}, fn c2, {i, acc} ->
               cost = if c1 == c2, do: 0, else: 1
-              deletion = Enum.at(row, i) + 1
+              deletion = elem(row, i) + 1
               insertion = hd(acc) + 1
-              substitution = Enum.at(row, i - 1) + cost
+              substitution = elem(row, i - 1) + cost
               {i + 1, [min(deletion, min(insertion, substitution)) | acc]}
             end)
 
-          new_row = Enum.reverse(new_row)
-          min_in_row = Enum.min(new_row)
+          new_row = List.to_tuple(Enum.reverse(new_row_list))
+          min_in_row = Enum.min(new_row_list)
 
           if min_in_row > max_dist do
             {new_row, true}
@@ -361,7 +364,7 @@ defmodule SearchService.Engine do
     if exceeded do
       max_dist + 1
     else
-      List.last(final_row)
+      elem(final_row, len2)
     end
   end
 
@@ -377,6 +380,17 @@ defmodule SearchService.Engine do
       right = scan_forward(vocab_array, idx, prefix, [])
 
       left ++ right
+    end
+  end
+
+  defp vocab_contains?(vocab_array, token) do
+    n = :array.size(vocab_array)
+
+    if n == 0 do
+      false
+    else
+      idx = find_lower_bound(vocab_array, token, 0, n)
+      idx < n and :array.get(idx, vocab_array) == token
     end
   end
 

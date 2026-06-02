@@ -28,6 +28,7 @@ defmodule SearchServiceWeb.Router do
     post("/documents", DocumentController, :create)
     delete("/documents/:id", DocumentController, :delete)
     post("/rebuild", DocumentController, :rebuild)
+    post("/snapshot", DocumentController, :snapshot)
   end
 
   match(:*, "/*path", SearchServiceWeb.FallbackController, :not_found)
