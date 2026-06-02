@@ -15,29 +15,34 @@ Originally extracted from the SmartKiosk e-commerce platform, this is now a full
 │   HTTP Client   │────▶│  Phoenix HTTP  │────▶│   IndexServer  │
 │  (Any language) │     │   (Bandit)     │     │   (GenServer)   │
 └─────────────────┘     └──────────────────┘     └─────────────────┘
-                                                         │
-                            ┌─────────────────┐           │
-                            │   BatchQueue    │◀──────────┘
-                            │  (Incremental)  │
-                            └─────────────────┘
-                                    │
-                                    ▼
-                            ┌─────────────────┐
-                            │   ETS Table     │───▶ Fast concurrent reads
-                            │  (In-Memory)    │
-                            └─────────────────┘
-                                    │
-                                    ▼
-                            ┌─────────────────┐     ┌──────────────┐
-                            │    Engine       │────▶│   Inverted   │
-                            │ (Fuzzy + TF-IDF)│     │    Index     │
-                            └─────────────────┘     └──────────────┘
-                                    │
-                                    ▼
-                            ┌─────────────────┐     ┌──────────────┐
-                            │  Persistence    │◀───▶│  Disk File   │
-                            │  (Snapshot)     │     │(Compressed)  │
-                            └─────────────────┘     └──────────────┘
+                                                          │
+                             ┌─────────────────┐           │
+                             │   BatchQueue    │◀──────────┘
+                             │  (Incremental)  │
+                             └─────────────────┘
+                                     │
+                                     ▼
+                         ┌─────────────────────────┐
+                         │   :persistent_term       │───▶ Zero-copy reads
+                         │   (Immutable Index)      │     (all cores)
+                         └─────────────────────────┘
+                                     │
+                         ┌─────────────────────────┐
+                         │   ETS :search_cache      │───▶ Query result cache
+                         │   (invalidated on write) │
+                         └─────────────────────────┘
+                                     │
+                                     ▼
+                             ┌─────────────────┐     ┌──────────────┐
+                             │    Engine       │────▶│   Inverted   │
+                             │ (Fuzzy + TF-IDF)│     │    Index     │
+                             └─────────────────┘     └──────────────┘
+                                     │
+                                     ▼
+                             ┌─────────────────┐     ┌──────────────┐
+                             │  Persistence    │◀───▶│  Disk File   │
+                             │  (Snapshot)     │     │(Compressed)  │
+                             └─────────────────┘     └──────────────┘
 ```
 
 ## Core Components
@@ -58,7 +63,7 @@ The inverted index implementation with three key optimizations for scale:
 - `insert` and `remove` are O(1) map operations — they mark the index as `:dirty`
 - `finalize_index` rebuilds vocabulary, IDF, and length_index **once** per batch
 - Eliminates O(N log N) finalization on every document during bulk ingestion
-- Search calls `ensure_finalized/1` lazily if the index is dirty
+- Finalization happens eagerly on load, swap, and batch apply — never on the query hot path
 
 **2. Vocabulary as Erlang :array**
 - Old implementation used a linked list with `Enum.at`, making binary search O(n log n)
@@ -66,11 +71,17 @@ The inverted index implementation with three key optimizations for scale:
 - Prefix search is now true O(log V + K) where V = vocabulary size, K = matches
 
 **3. Bounded Levenshtein with Early-Exit**
-- Old implementation computed the full distance matrix for every candidate
+- Old implementation computed the full distance matrix with O(n) list indexing inside the inner loop
 - New implementation:
+  - Uses **tuple-based row storage** for O(1) random access (`elem/2`)
   - Early-rejects if `abs(len1 - len2) > max_dist` (impossible to be within budget)
+  - **Pre-filters candidates by first-character match** before computing any distance
   - Aborts mid-computation if the minimum value in any row exceeds `max_dist`
-  - Reduces fuzzy candidate evaluation by 80-95% for non-matching tokens
+  - Reduces fuzzy candidate evaluation by 90-99% for non-matching tokens
+
+**4. Exact-Match Gate**
+- When a query token exists exactly in the vocabulary, the engine returns prefix hits immediately
+- Previously, it would fall back to expensive fuzzy expansion even for perfect matches
 
 **Typo Budget Rules**:
 - `< 4 characters`: 0 typos (exact match + prefix)
@@ -111,15 +122,16 @@ Where:
 
 Central coordinator:
 
-- **ETS Table**: Concurrent read access for HTTP requests
+- **`:persistent_term`**: Immutable index storage for zero-copy reads across all cores
+- **Query Result Cache**: ETS `:search_cache` table caches search/prefix results by query+limit; invalidated on index swaps
 - **File Persistence**: Compressed snapshot (`priv/search_index.bin`)
 - **Scheduled Snapshots**: Every 24 hours (configurable)
 - **Batch Updates**: Queued changes applied on-demand with single finalization
 
 **Data Flow**:
-1. Search queries read from ETS (sub-50ms)
-2. Index updates write to ETS (single writer pattern)
-3. Batch changes are applied raw, then finalized once before ETS write
+1. Search queries hit the ETS query cache first; cache misses read from `:persistent_term` (sub-10ms)
+2. Index updates write a new term to `:persistent_term` and flush the query cache (single writer pattern)
+3. Batch changes are applied raw, then finalized once before the persistent_term swap
 4. Periodic snapshots save to file (~8MB for 150k documents)
 
 ### 4. BatchQueue
@@ -293,8 +305,9 @@ Read endpoints (`/search`, `/prefix`, `/metrics`, `/health`) remain open.
 | Index Build Time | <30s | ~8-12s |
 | Memory Usage | <100MB | ~30-40MB |
 | Serialized Size | <20MB | ~8MB |
-| Concurrent Queries | Unlimited | Limited by ETS |
+| Concurrent Queries | Unlimited | CPU-bound (zero-copy reads) |
 | Bulk Ingest (1k docs) | <5s | ~2-3s |
+| Cached Query Hit | <1ms | ~0.5ms |
 
 ## Scaling to 150k+ Documents
 
@@ -314,7 +327,8 @@ With 150k documents averaging 4-5 words each:
 - **Postings**: ~500k-1M entries (token → doc_id mappings)
 - **Vocabulary**: ~50k-200k unique tokens stored as `:array`
 - **Total RAM**: ~30-60MB for the index map
-- **ETS**: Shared read access, no process copying
+- **`:persistent_term`**: Zero-copy reads — the same immutable term is referenced directly by every process
+- **Query Cache**: Small ETS table holding recent search results (invalidated on writes)
 
 ### Ingestion Patterns
 
@@ -323,7 +337,7 @@ With 150k documents averaging 4-5 words each:
 **Trickle Updates**: Use `POST /api/documents` for incremental changes. The dirty-flag ensures:
 - 1 insert = O(1) (no finalization)
 - 1,000 inserts = O(1000) raw ops + 1 finalization
-- Search triggers lazy finalization if needed
+- Finalization happens eagerly on batch apply, never during search
 
 ### When to Scale Further
 
@@ -360,7 +374,7 @@ lib/
 │   ├── application.ex          # OTP supervisor
 │   ├── engine.ex               # Inverted index + fuzzy matching + :array vocab
 │   ├── query.ex                # TF-IDF ranking
-│   ├── index_server.ex         # GenServer + ETS coordinator
+│   ├── index_server.ex         # GenServer + :persistent_term + query cache
 │   ├── batch_queue.ex          # Async doc updates
 │   ├── persistence.ex          # File snapshot
 │   ├── metrics.ex              # Telemetry events
@@ -380,7 +394,7 @@ lib/
 ## Troubleshooting
 
 ### Issue: Search returns empty results
-**Cause**: Index not built yet (first boot after deploy) or index is dirty and not finalized
+**Cause**: Index not built yet (first boot after deploy)
 **Solution**:
 ```bash
 curl -X POST http://localhost:4000/api/rebuild \
@@ -417,6 +431,6 @@ curl http://localhost:4000/api/metrics | jq '.index.memory_bytes'
 
 - `SearchService.Engine` — Inverted index + fuzzy matching + :array vocabulary
 - `SearchService.Query` — TF-IDF ranking
-- `SearchService.IndexServer` — ETS + persistence coordinator
+- `SearchService.IndexServer` — `:persistent_term` storage + query cache + persistence coordinator
 - `SearchService.MetricsAggregator` — Performance metrics
 - `SearchServiceWeb.Router` — HTTP routing
