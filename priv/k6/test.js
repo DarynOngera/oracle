@@ -1,23 +1,17 @@
 import http from "k6/http";
 import { check, sleep } from "k6";
+import { htmlReport } from "https://raw.githubusercontent.com/benc-uk/k6-reporter/main/dist/bundle.js";
 
 const BASE_URL = __ENV.BASE_URL || "http://localhost:4000";
-const RATE = parseInt(__ENV.RATE || "500");
-const DURATION = __ENV.DURATION || "5m";
-const PRE_ALLOCATED_VUS = parseInt(__ENV.PRE_ALLOCATED_VUS || "100");
-const MAX_VUS = parseInt(__ENV.MAX_VUS || "1000");
 
 export const options = {
-  scenarios: {
-    search_sustained_load: {
-      executor: "constant-arrival-rate",
-      rate: RATE,
-      timeUnit: "1s",
-      duration: DURATION,
-      preAllocatedVUs: PRE_ALLOCATED_VUS,
-      maxVUs: MAX_VUS,
-    },
-  },
+  stages: [
+    { duration: "2m", target: 250 },
+    { duration: "2m", target: 500 },
+    { duration: "3m", target: 1000 },
+    { duration: "10m", target: 1000 },
+    { duration: "2m", target: 0 },
+  ],
 
   thresholds: {
     http_req_failed: ["rate<0.01"],
@@ -26,6 +20,7 @@ export const options = {
       "p(95)<50",
       "p(99)<100",
     ],
+    iterations: ["count>1000000"],
   },
 };
 
@@ -100,4 +95,10 @@ export default function () {
       r.headers["Content-Type"] &&
       r.headers["Content-Type"].includes("application/json"),
   });
+}
+
+export function handleSummary(data) {
+  return {
+    "report.html": htmlReport(data),
+  };
 }
