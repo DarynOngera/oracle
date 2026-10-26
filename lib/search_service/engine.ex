@@ -118,61 +118,86 @@ defmodule SearchService.Engine do
     query
     |> tokenize()
     |> Enum.reduce(%{}, fn token, acc ->
-      if map_size(acc) >= collect_limit do
-        acc
-      else
-        prefix_tokens = prefix_matches(index.vocabulary, token)
-        exact_match = vocab_contains?(index.vocabulary, token)
-
-        acc =
-          Enum.reduce(prefix_tokens, acc, fn vocab_token, inner_acc ->
-            if map_size(inner_acc) >= collect_limit do
-              inner_acc
-            else
-              entries = Map.get(index.postings, vocab_token, [])
-
-              Enum.reduce(entries, inner_acc, fn {doc_id, field, _weight}, deepest_acc ->
-                if map_size(deepest_acc) >= collect_limit do
-                  deepest_acc
-                else
-                  Map.put(deepest_acc, doc_id, {0, field})
-                end
-              end)
-            end
-          end)
-
-        if map_size(acc) >= collect_limit or exact_match do
-          acc
-        else
-          fuzzy_candidates(index, token, max_typos)
-          |> Enum.reject(fn {_token, distance} -> distance == 0 end)
-          |> Enum.reduce(acc, fn {vocab_token, distance}, inner_acc ->
-            if map_size(inner_acc) >= collect_limit do
-              inner_acc
-            else
-              entries = Map.get(index.postings, vocab_token, [])
-
-              Enum.reduce(entries, inner_acc, fn {doc_id, field, _weight}, deepest_acc ->
-                if map_size(deepest_acc) >= collect_limit do
-                  deepest_acc
-                else
-                  Map.update(deepest_acc, doc_id, {distance, field}, fn {existing_dist,
-                                                                         existing_field} ->
-                    if distance < existing_dist do
-                      {distance, field}
-                    else
-                      {existing_dist, existing_field}
-                    end
-                  end)
-                end
-              end)
-            end
-          end)
-        end
-      end
+      collect_token(index, token, acc, max_typos, collect_limit)
     end)
     |> Enum.sort_by(fn {_doc_id, {distance, _field}} -> distance end)
     |> Enum.map(fn {doc_id, {distance, field}} -> {doc_id, distance, field} end)
+  end
+
+  # --- token processing (replaces nested if/else) ---
+
+  defp collect_token(_index, _token, acc, _max_typos, collect_limit)
+       when map_size(acc) >= collect_limit do
+    acc
+  end
+
+  defp collect_token(index, token, acc, max_typos, collect_limit) do
+    prefix_tokens = prefix_matches(index.vocabulary, token)
+    exact_match = vocab_contains?(index.vocabulary, token)
+
+    acc_after_prefix =
+      Enum.reduce(prefix_tokens, acc, fn vocab_token, inner_acc ->
+        collect_prefix_entries(index, vocab_token, inner_acc, collect_limit)
+      end)
+
+    cond do
+      map_size(acc_after_prefix) >= collect_limit ->
+        acc_after_prefix
+
+      exact_match ->
+        acc_after_prefix
+
+      true ->
+        collect_fuzzy(index, token, max_typos, acc_after_prefix, collect_limit)
+    end
+  end
+
+  # --- prefix collection (same logic, flattened) ---
+
+  defp collect_prefix_entries(_index, _vocab_token, acc, collect_limit)
+       when map_size(acc) >= collect_limit do
+    acc
+  end
+
+  defp collect_prefix_entries(index, vocab_token, acc, collect_limit) do
+    entries = Map.get(index.postings, vocab_token, [])
+
+    Enum.reduce(entries, acc, fn {doc_id, field, _weight}, acc ->
+      if map_size(acc) >= collect_limit do
+        acc
+      else
+        Map.put(acc, doc_id, {0, field})
+      end
+    end)
+  end
+
+  # --- fuzzy branch extracted cleanly ---
+
+  defp collect_fuzzy(_index, _token, _max_typos, acc, collect_limit)
+       when map_size(acc) >= collect_limit do
+    acc
+  end
+
+  defp collect_fuzzy(index, token, max_typos, acc, collect_limit) do
+    fuzzy_candidates(index, token, max_typos)
+    |> Enum.reject(fn {_token, distance} -> distance == 0 end)
+    |> Enum.reduce(acc, fn {vocab_token, distance}, acc ->
+      entries = Map.get(index.postings, vocab_token, [])
+
+      Enum.reduce(entries, acc, fn {doc_id, field, _weight}, acc ->
+        if map_size(acc) >= collect_limit do
+          acc
+        else
+          Map.update(acc, doc_id, {distance, field}, fn {existing_dist, existing_field} ->
+            if distance < existing_dist do
+              {distance, field}
+            else
+              {existing_dist, existing_field}
+            end
+          end)
+        end
+      end)
+    end)
   end
 
   def prefix_search(index, query, opts \\ []) do

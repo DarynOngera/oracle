@@ -34,3 +34,5 @@ search_service-*.tar
 
 # OS files
 .DS_Store
+priv/k6/results.csv
+priv/k6/results.json
